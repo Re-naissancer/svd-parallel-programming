@@ -183,6 +183,7 @@
 // }
 
 
+
 // bidiagonalization.cpp
 // 将 m×n 矩阵（本框架保证m ≥ n）通过 Householder 变换化为上双对角形
 //
@@ -206,20 +207,18 @@
 #include <stdexcept>
 #include <vector>
 
-#if defined(__ARM_NEON) && defined(__aarch64__) && !defined(SVD_DISABLE_NEON)
-#include <arm_neon.h>
-#define SVD_USE_NEON 1
-#else
-#define SVD_USE_NEON 0
+#if defined(SVD_DISABLE_NEON) || !defined(__ARM_NEON) || !defined(__aarch64__)
+#error "This SIMD lab build requires AArch64 NEON. Please compile on the ARM server with NEON enabled."
 #endif
 
+#include <arm_neon.h>
+
 // 连续内存点积。ARMv8/AArch64 上使用 NEON 的 128-bit float64x2_t，
-// 非 ARM 平台保留标量版本，方便本地调试。
+// 尾部单个元素用标量补齐，主体计算必须启用 NEON 才能编译。
 static double dot_contiguous(const double *a, const double *b, int len)
 {
     double sum = 0.0;
     int i = 0;
-#if SVD_USE_NEON
     float64x2_t acc = vdupq_n_f64(0.0);
     for (; i + 1 < len; i += 2)
     {
@@ -228,7 +227,6 @@ static double dot_contiguous(const double *a, const double *b, int len)
     double lanes[2];
     vst1q_f64(lanes, acc);
     sum = lanes[0] + lanes[1];
-#endif
     for (; i < len; ++i)
     {
         sum += a[i] * b[i];
@@ -239,7 +237,6 @@ static double dot_contiguous(const double *a, const double *b, int len)
 static void add_scaled_row(double *dst, const double *src, int len, double scale)
 {
     int j = 0;
-#if SVD_USE_NEON
     const float64x2_t s = vdupq_n_f64(scale);
     for (; j + 1 < len; j += 2)
     {
@@ -248,7 +245,6 @@ static void add_scaled_row(double *dst, const double *src, int len, double scale
         d = vaddq_f64(d, vmulq_f64(s, x));
         vst1q_f64(dst + j, d);
     }
-#endif
     for (; j < len; ++j)
     {
         dst[j] += scale * src[j];
@@ -258,7 +254,6 @@ static void add_scaled_row(double *dst, const double *src, int len, double scale
 static void sub_scaled_row(double *dst, const double *src, int len, double scale)
 {
     int j = 0;
-#if SVD_USE_NEON
     const float64x2_t s = vdupq_n_f64(scale);
     for (; j + 1 < len; j += 2)
     {
@@ -267,7 +262,6 @@ static void sub_scaled_row(double *dst, const double *src, int len, double scale
         d = vsubq_f64(d, vmulq_f64(s, x));
         vst1q_f64(dst + j, d);
     }
-#endif
     for (; j < len; ++j)
     {
         dst[j] -= scale * src[j];

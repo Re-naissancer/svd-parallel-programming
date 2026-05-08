@@ -387,12 +387,11 @@
 #include <stdexcept>
 #include <vector>
 
-#if defined(__ARM_NEON) && defined(__aarch64__) && !defined(SVD_DISABLE_NEON)
-#include <arm_neon.h>
-#define SVD_USE_NEON 1
-#else
-#define SVD_USE_NEON 0
+#if defined(SVD_DISABLE_NEON) || !defined(__ARM_NEON) || !defined(__aarch64__)
+#error "This SIMD lab build requires AArch64 NEON. Please compile on the ARM server with NEON enabled."
 #endif
+
+#include <arm_neon.h>
 
 namespace
 {
@@ -413,7 +412,6 @@ namespace
         double *row0 = M.row_ptr(r0);
         double *row1 = M.row_ptr(r1);
         int j = 0;
-#if SVD_USE_NEON
         const float64x2_t cv = vdupq_n_f64(c);
         const float64x2_t sv = vdupq_n_f64(s);
         for (; j + 1 < M.cols(); j += 2)
@@ -423,7 +421,6 @@ namespace
             vst1q_f64(row0 + j, vaddq_f64(vmulq_f64(cv, a), vmulq_f64(sv, b)));
             vst1q_f64(row1 + j, vsubq_f64(vmulq_f64(cv, b), vmulq_f64(sv, a)));
         }
-#endif
         for (; j < M.cols(); ++j)
         {
             double a = row0[j];
@@ -830,4 +827,3 @@ bool gkh_svd_from_bidiagonal(Matrix &U, Matrix &B, Matrix &V, int max_iter, doub
 
     return converged;
 }
-
