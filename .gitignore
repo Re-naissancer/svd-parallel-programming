@@ -1,0 +1,56 @@
+# =========================
+# C/C++ build outputs
+# =========================
+
+# executable files
+/main
+*.out
+*.exe
+*.app
+
+# object files / libraries
+*.o
+*.obj
+*.a
+*.so
+*.dll
+*.dylib
+
+# build directories
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+Makefile
+compile_commands.json
+
+# =========================
+# Runtime / test outputs
+# =========================
+
+*.log
+*.tmp
+*.dat
+*.csv
+
+# 如果 files/ 里是测试输入输出数据，并且你不想提交，就保留这一行
+# 如果 files/ 是作业必须提交的数据，就删掉这一行
+files/
+
+# =========================
+# Editor / system files
+# =========================
+
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# =========================
+# Backup files
+# =========================
+
+*~
+*.bak
+*.swp
+*.swo
