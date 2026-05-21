@@ -3,16 +3,14 @@
 #include "givens.h"
 #include <algorithm>
 #include <cmath>
-#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <limits>
-#include <pthread.h>
 #include <stdexcept>
 #include <string>
 #include <vector>
-#include <unistd.h>
+#include <omp.h>
 
 #if defined(SVD_DISABLE_NEON) || !defined(__ARM_NEON) || !defined(__aarch64__)
 #error "This SIMD lab build requires AArch64 NEON. Please compile on the ARM server with NEON enabled."
@@ -37,21 +35,27 @@ namespace
         return len * len;
     }
 
+    static int read_positive_env(const char *name)
+    {
+        const char *env = std::getenv(name);
+        if (env == nullptr)
+        {
+            return 0;
+        }
+        const int value = std::atoi(env);
+        return value > 0 ? value : 0;
+    }
+
     static int choose_thread_count(int n)
     {
-        int threads = 0;
-        const char *env = std::getenv("SVD_PTHREADS");
-        if (env != nullptr)
+        int threads = read_positive_env("SVD_OMP_THREADS");
+        if (threads <= 0)
         {
-            threads = std::atoi(env);
+            threads = read_positive_env("OMP_NUM_THREADS");
         }
         if (threads <= 0)
         {
-            env = std::getenv("PBS_NUM_PPN");
-            if (env != nullptr)
-            {
-                threads = std::atoi(env);
-            }
+            threads = read_positive_env("PBS_NUM_PPN");
         }
         if (threads <= 0)
         {
@@ -71,8 +75,11 @@ namespace
         }
         if (threads <= 0)
         {
-            const long online = sysconf(_SC_NPROCESSORS_ONLN);
-            threads = (online > 0) ? static_cast<int>(online) : 1;
+            threads = omp_get_max_threads();
+        }
+        if (threads <= 0)
+        {
+            threads = omp_get_num_procs();
         }
         return std::min(std::max(1, threads), std::max(1, n));
     }
@@ -284,8 +291,7 @@ namespace
         const double x = B.at(l, l) * B.at(l, l) - mu;
         const double z = B.at(l, l) * B.at(l, l + 1);
         givens_rotation(x, z, c, s, rr, false);
-        // Keep B writes inside this active block. Split boundaries are already
-        // zero, so different blocks update disjoint B/U/V locations.
+        // 限制 B 的写范围在当前活动块内，避免相邻块边界被并行任务同时写入。
         apply_right_cols_range(B, l, l + 1, l, std::min(l + 1, r), c, s);
         apply_right_cols(V, l, l + 1, c, s);
 
@@ -491,6 +497,9 @@ bool gkh_svd_from_bidiagonal(Matrix &U, Matrix &B, Matrix &V, int max_iter, doub
 
     bool converged = false;
     const int thread_count = choose_thread_count(n);
+    omp_set_dynamic(0);
+    omp_set_num_threads(thread_count);
+
     std::vector<long long> thread_blocks(thread_count, 0);
     std::vector<long long> thread_work(thread_count, 0);
     long long active_rounds = 0;
@@ -537,64 +546,17 @@ bool gkh_svd_from_bidiagonal(Matrix &U, Matrix &B, Matrix &V, int max_iter, doub
             continue;
         }
 
-        // 简单非线程池版本：每一轮重新创建 pthread，静态连续分配子块。
+        // 简单非线程池版本：每轮直接用一次 OpenMP parallel for，静态连续分配子块。
         std::reverse(work_blocks.begin(), work_blocks.end());
-        const int workers = std::min(thread_count, static_cast<int>(work_blocks.size()));
-        const int chunk = (static_cast<int>(work_blocks.size()) + workers - 1) / workers;
-
-        struct StaticContext
+        const int task_count = static_cast<int>(work_blocks.size());
+#pragma omp parallel for num_threads(thread_count) schedule(static)
+        for (int i = 0; i < task_count; ++i)
         {
-            Matrix *U;
-            Matrix *B;
-            Matrix *V;
-            const std::vector<Block> *tasks;
-            int chunk;
-            std::vector<long long> *thread_blocks;
-            std::vector<long long> *thread_work;
-        };
-
-        struct WorkerArg
-        {
-            StaticContext *ctx;
-            int id;
-        };
-
-        auto worker_fn = [](void *raw) -> void *
-        {
-            WorkerArg *arg = static_cast<WorkerArg *>(raw);
-            StaticContext *ctx = arg->ctx;
-            const int begin = arg->id * ctx->chunk;
-            const int end = std::min(static_cast<int>(ctx->tasks->size()), begin + ctx->chunk);
-
-            for (int i = begin; i < end; ++i)
-            {
-                const Block blk = (*(ctx->tasks))[i];
-                one_block_step(*ctx->U, *ctx->B, *ctx->V, blk.l, blk.r);
-                (*(ctx->thread_blocks))[arg->id] += 1;
-                (*(ctx->thread_work))[arg->id] += block_work(blk);
-            }
-            return nullptr;
-        };
-
-        StaticContext ctx{&U, &B, &V, &work_blocks, chunk, &thread_blocks, &thread_work};
-        std::vector<pthread_t> tids(workers - 1);
-        std::vector<WorkerArg> args(workers);
-
-        for (int id = 1; id < workers; ++id)
-        {
-            args[id] = WorkerArg{&ctx, id};
-            if (pthread_create(&tids[id - 1], nullptr, worker_fn, &args[id]) != 0)
-            {
-                throw std::runtime_error("pthread_create failed");
-            }
-        }
-
-        args[0] = WorkerArg{&ctx, 0};
-        worker_fn(&args[0]);
-
-        for (int id = 1; id < workers; ++id)
-        {
-            pthread_join(tids[id - 1], nullptr);
+            const int tid = omp_get_thread_num();
+            const Block blk = work_blocks[i];
+            one_block_step(U, B, V, blk.l, blk.r);
+            thread_blocks[tid] += 1;
+            thread_work[tid] += block_work(blk);
         }
     }
 
@@ -606,11 +568,11 @@ bool gkh_svd_from_bidiagonal(Matrix &U, Matrix &B, Matrix &V, int max_iter, doub
     }
     make_nonnegative_and_sort(U, B, V);
 
-    std::printf("[pthread nopool static] threads=%d active_rounds=%lld single_block_rounds=%lld max_blocks_in_round=%lld serial_single_block_work=%lld\n",
+    std::printf("[openmp nopool static] threads=%d active_rounds=%lld single_block_rounds=%lld max_blocks_in_round=%lld serial_single_block_work=%lld\n",
                 thread_count, active_rounds, single_block_rounds, max_blocks_in_round, serial_single_block_work);
     for (int id = 0; id < thread_count; ++id)
     {
-        std::printf("[pthread nopool static] worker %d: blocks=%lld work=%lld\n",
+        std::printf("[openmp nopool static] worker %d: blocks=%lld work=%lld\n",
                     id, thread_blocks[id], thread_work[id]);
     }
 
