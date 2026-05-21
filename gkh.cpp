@@ -502,61 +502,93 @@ bool gkh_svd_from_bidiagonal(Matrix &U, Matrix &B, Matrix &V, int max_iter, doub
 
     std::vector<long long> thread_blocks(thread_count, 0);
     std::vector<long long> thread_work(thread_count, 0);
+    std::vector<Block> work_blocks;
     long long active_rounds = 0;
     long long single_block_rounds = 0;
     long long max_blocks_in_round = 0;
     long long serial_single_block_work = 0;
+    int used_threads = thread_count;
+    bool stop = false;
+    bool has_parallel_work = false;
 
-    for (int iter = 0; iter < max_iter; ++iter)
+#pragma omp parallel num_threads(thread_count) shared(U, B, V, converged, work_blocks, active_rounds, single_block_rounds, max_blocks_in_round, serial_single_block_work, thread_blocks, thread_work, used_threads, stop, has_parallel_work)
     {
-        // 清理数值噪声，并优先处理 d_k≈0 的特殊情形。
-        cleanup_bidiagonal(B, tol);
-        handle_diagonal_zeros(U, B, V, tol);
-
-        // 根据超对角线断点拆分活动块
-        // 这里子矩阵间是相互独立的，所以此处具有很大的并行潜力：你可以尝试多线程/多进程进行处理
-        // 但根据算法，收集 Givens 旋转并更新 U/V 需要在每个块内顺序执行，所以这可能给并行带来麻烦。
-        std::vector<Block> blocks = split_active_blocks(B, n, tol);
-
-        // 若全部是 1x1 块，说明所有超对角都已收敛为 0。
-        std::vector<Block> work_blocks;
-        work_blocks.reserve(blocks.size());
-        for (const auto &blk : blocks)
+        for (int iter = 0; iter < max_iter; ++iter)
         {
-            if (blk.r > blk.l)
+            // 线程池版本：只建立一次 OpenMP 并行区，后续每轮复用同一组线程。
+#pragma omp single
             {
-                work_blocks.push_back(blk);
+                used_threads = omp_get_num_threads();
+                work_blocks.clear();
+                stop = false;
+                has_parallel_work = false;
+
+                // 清理数值噪声，并优先处理 d_k≈0 的特殊情形。
+                cleanup_bidiagonal(B, tol);
+                handle_diagonal_zeros(U, B, V, tol);
+
+                // 根据超对角线断点拆分活动块
+                // 这里子矩阵间是相互独立的，所以此处具有很大的并行潜力：你可以尝试多线程/多进程进行处理
+                // 但根据算法，收集 Givens 旋转并更新 U/V 需要在每个块内顺序执行，所以这可能给并行带来麻烦。
+                std::vector<Block> blocks = split_active_blocks(B, n, tol);
+
+                for (const auto &blk : blocks)
+                {
+                    if (blk.r > blk.l)
+                    {
+                        work_blocks.push_back(blk);
+                    }
+                }
+
+                if (work_blocks.empty())
+                {
+                    converged = true;
+                    stop = true;
+                }
+                else
+                {
+                    ++active_rounds;
+                    max_blocks_in_round = std::max(max_blocks_in_round, static_cast<long long>(work_blocks.size()));
+                    if (work_blocks.size() == 1)
+                    {
+                        ++single_block_rounds;
+                        const Block blk = work_blocks[0];
+                        one_block_step(U, B, V, blk.l, blk.r);
+                        serial_single_block_work += block_work(blk);
+                    }
+                    else
+                    {
+                        std::sort(work_blocks.begin(), work_blocks.end(), [](const Block &a, const Block &b)
+                                  {
+                                      const long long wa = block_work(a);
+                                      const long long wb = block_work(b);
+                                      return (wa != wb) ? (wa > wb) : (a.l > b.l);
+                                  });
+                        has_parallel_work = true;
+                    }
+                }
             }
-        }
 
-        if (work_blocks.empty())
-        {
-            converged = true;
-            break;
-        }
+            if (stop)
+            {
+                break;
+            }
 
-        ++active_rounds;
-        max_blocks_in_round = std::max(max_blocks_in_round, static_cast<long long>(work_blocks.size()));
-        if (work_blocks.size() == 1)
-        {
-            ++single_block_rounds;
-            const Block blk = work_blocks[0];
-            one_block_step(U, B, V, blk.l, blk.r);
-            serial_single_block_work += block_work(blk);
-            continue;
-        }
+            if (has_parallel_work)
+            {
+                const int task_count = static_cast<int>(work_blocks.size());
+#pragma omp for schedule(dynamic, 1) nowait
+                for (int i = 0; i < task_count; ++i)
+                {
+                    const int tid = omp_get_thread_num();
+                    const Block blk = work_blocks[i];
+                    one_block_step(U, B, V, blk.l, blk.r);
+                    thread_blocks[tid] += 1;
+                    thread_work[tid] += block_work(blk);
+                }
+            }
 
-        // 简单非线程池版本：每轮直接用一次 OpenMP parallel for，静态连续分配子块。
-        std::reverse(work_blocks.begin(), work_blocks.end());
-        const int task_count = static_cast<int>(work_blocks.size());
-#pragma omp parallel for num_threads(thread_count) schedule(static)
-        for (int i = 0; i < task_count; ++i)
-        {
-            const int tid = omp_get_thread_num();
-            const Block blk = work_blocks[i];
-            one_block_step(U, B, V, blk.l, blk.r);
-            thread_blocks[tid] += 1;
-            thread_work[tid] += block_work(blk);
+#pragma omp barrier
         }
     }
 
@@ -568,11 +600,11 @@ bool gkh_svd_from_bidiagonal(Matrix &U, Matrix &B, Matrix &V, int max_iter, doub
     }
     make_nonnegative_and_sort(U, B, V);
 
-    std::printf("[openmp nopool static] threads=%d active_rounds=%lld single_block_rounds=%lld max_blocks_in_round=%lld serial_single_block_work=%lld\n",
-                thread_count, active_rounds, single_block_rounds, max_blocks_in_round, serial_single_block_work);
-    for (int id = 0; id < thread_count; ++id)
+    std::printf("[openmp pool dynamic] threads=%d active_rounds=%lld single_block_rounds=%lld max_blocks_in_round=%lld serial_single_block_work=%lld\n",
+                used_threads, active_rounds, single_block_rounds, max_blocks_in_round, serial_single_block_work);
+    for (int id = 0; id < used_threads; ++id)
     {
-        std::printf("[openmp nopool static] worker %d: blocks=%lld work=%lld\n",
+        std::printf("[openmp pool dynamic] worker %d: blocks=%lld work=%lld\n",
                     id, thread_blocks[id], thread_work[id]);
     }
 
