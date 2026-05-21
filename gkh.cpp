@@ -3,9 +3,16 @@
 #include "givens.h"
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
+#include <cstdio>
+#include <cstdlib>
+#include <fstream>
 #include <limits>
+#include <pthread.h>
 #include <stdexcept>
+#include <string>
 #include <vector>
+#include <unistd.h>
 
 #if defined(SVD_DISABLE_NEON) || !defined(__ARM_NEON) || !defined(__aarch64__)
 #error "This SIMD lab build requires AArch64 NEON. Please compile on the ARM server with NEON enabled."
@@ -23,6 +30,52 @@ namespace
         int l;
         int r;
     };
+
+    static long long block_work(const Block &blk)
+    {
+        const long long len = static_cast<long long>(blk.r - blk.l + 1);
+        return len * len;
+    }
+
+    static int choose_thread_count(int n)
+    {
+        int threads = 0;
+        const char *env = std::getenv("SVD_PTHREADS");
+        if (env != nullptr)
+        {
+            threads = std::atoi(env);
+        }
+        if (threads <= 0)
+        {
+            env = std::getenv("PBS_NUM_PPN");
+            if (env != nullptr)
+            {
+                threads = std::atoi(env);
+            }
+        }
+        if (threads <= 0)
+        {
+            const char *nodefile = std::getenv("PBS_NODEFILE");
+            if (nodefile != nullptr)
+            {
+                std::ifstream in(nodefile);
+                std::string line;
+                while (std::getline(in, line))
+                {
+                    if (!line.empty())
+                    {
+                        ++threads;
+                    }
+                }
+            }
+        }
+        if (threads <= 0)
+        {
+            const long online = sysconf(_SC_NPROCESSORS_ONLN);
+            threads = (online > 0) ? static_cast<int>(online) : 1;
+        }
+        return std::min(std::max(1, threads), std::max(1, n));
+    }
 
     static inline void rotate_right_adjacent_cols_neon(double *row, int c0, const float64x2_t vc, const float64x2_t vsign)
     {
@@ -231,24 +284,26 @@ namespace
         const double x = B.at(l, l) * B.at(l, l) - mu;
         const double z = B.at(l, l) * B.at(l, l + 1);
         givens_rotation(x, z, c, s, rr, false);
-        apply_right_cols_range(B, l, l + 1, l - 1, l + 1, c, s);
+        // Keep B writes inside this active block. Split boundaries are already
+        // zero, so different blocks then update disjoint B/U/V locations.
+        apply_right_cols_range(B, l, l + 1, l, std::min(l + 1, r), c, s);
         apply_right_cols(V, l, l + 1, c, s);
 
         // 首次左乘：消去 (l+1, l)。
         givens_rotation(B.at(l, l), B.at(l + 1, l), c, s, rr, true);
-        apply_left_rows_range(B, l, l + 1, l - 1, l + 2, c, s);
+        apply_left_rows_range(B, l, l + 1, l, std::min(l + 2, r), c, s);
         accumulate_left_into_U(U, l, l + 1, c, s);
 
         for (int k = l + 1; k <= r - 1; ++k)
         {
             // 右乘：消去 (k-1, k+1)
             givens_rotation(B.at(k - 1, k), B.at(k - 1, k + 1), c, s, rr, false);
-            apply_right_cols_range(B, k, k + 1, k - 1, k + 1, c, s);
+            apply_right_cols_range(B, k, k + 1, std::max(k - 1, l), std::min(k + 1, r), c, s);
             apply_right_cols(V, k, k + 1, c, s);
 
             // 左乘：消去 (k+1, k)
             givens_rotation(B.at(k, k), B.at(k + 1, k), c, s, rr, true);
-            apply_left_rows_range(B, k, k + 1, k - 1, k + 2, c, s);
+            apply_left_rows_range(B, k, k + 1, std::max(k - 1, l), std::min(k + 2, r), c, s);
             accumulate_left_into_U(U, k, k + 1, c, s);
         }
     }
@@ -356,6 +411,230 @@ namespace
         return blocks;
     }
 
+    struct WorkerStats
+    {
+        long long blocks = 0;
+        long long work = 0;
+    };
+
+    class PthreadBlockPool
+    {
+        struct WorkerArg
+        {
+            PthreadBlockPool *pool;
+            int id;
+        };
+
+    public:
+        explicit PthreadBlockPool(int thread_count)
+            : stop_(false),
+              generation_(0),
+              completed_generation_(0),
+              tasks_(nullptr),
+              next_task_(0),
+              active_workers_(0),
+              U_(nullptr),
+              B_(nullptr),
+              V_(nullptr)
+        {
+            thread_count_ = std::max(1, thread_count);
+            pthread_mutex_init(&mutex_, nullptr);
+            pthread_cond_init(&work_cv_, nullptr);
+            pthread_cond_init(&done_cv_, nullptr);
+
+            stats_.resize(thread_count_);
+            if (thread_count_ <= 1)
+            {
+                return;
+            }
+
+            threads_.resize(thread_count_);
+            args_.resize(thread_count_);
+            int created = 0;
+            for (int id = 0; id < thread_count_; ++id)
+            {
+                args_[id].pool = this;
+                args_[id].id = id;
+                if (pthread_create(&threads_[id], nullptr, &PthreadBlockPool::worker_entry, &args_[id]) != 0)
+                {
+                    break;
+                }
+                ++created;
+            }
+            thread_count_ = created;
+            threads_.resize(thread_count_);
+            args_.resize(thread_count_);
+            stats_.resize(std::max(1, thread_count_));
+        }
+
+        ~PthreadBlockPool()
+        {
+            pthread_mutex_lock(&mutex_);
+            stop_ = true;
+            pthread_cond_broadcast(&work_cv_);
+            pthread_mutex_unlock(&mutex_);
+
+            for (int i = 0; i < thread_count_; ++i)
+            {
+                pthread_join(threads_[i], nullptr);
+            }
+
+            pthread_cond_destroy(&done_cv_);
+            pthread_cond_destroy(&work_cv_);
+            pthread_mutex_destroy(&mutex_);
+        }
+
+        int thread_count() const
+        {
+            return std::max(1, thread_count_);
+        }
+
+        void run(Matrix &U, Matrix &B, Matrix &V, const std::vector<Block> &tasks)
+        {
+            if (tasks.empty())
+            {
+                return;
+            }
+
+            if (thread_count_ <= 1)
+            {
+                for (const Block &blk : tasks)
+                {
+                    one_block_step(U, B, V, blk.l, blk.r);
+                    stats_[0].blocks += 1;
+                    stats_[0].work += block_work(blk);
+                }
+                return;
+            }
+
+            pthread_mutex_lock(&mutex_);
+            U_ = &U;
+            B_ = &B;
+            V_ = &V;
+            tasks_ = &tasks;
+            next_task_ = 0;
+            active_workers_ = 0;
+            ++generation_;
+            const unsigned my_generation = generation_;
+            pthread_cond_broadcast(&work_cv_);
+            while (completed_generation_ != my_generation)
+            {
+                pthread_cond_wait(&done_cv_, &mutex_);
+            }
+            tasks_ = nullptr;
+            U_ = nullptr;
+            B_ = nullptr;
+            V_ = nullptr;
+            pthread_mutex_unlock(&mutex_);
+        }
+
+        const std::vector<WorkerStats> &stats() const
+        {
+            return stats_;
+        }
+
+    private:
+        static void *worker_entry(void *raw)
+        {
+            WorkerArg *arg = static_cast<WorkerArg *>(raw);
+            arg->pool->worker_loop(arg->id);
+            return nullptr;
+        }
+
+        void worker_loop(int id)
+        {
+            unsigned seen_generation = 0;
+            for (;;)
+            {
+                pthread_mutex_lock(&mutex_);
+                while (!stop_ && generation_ == seen_generation)
+                {
+                    pthread_cond_wait(&work_cv_, &mutex_);
+                }
+
+                if (stop_)
+                {
+                    pthread_mutex_unlock(&mutex_);
+                    break;
+                }
+
+                seen_generation = generation_;
+                pthread_mutex_unlock(&mutex_);
+
+                process_tasks(id, seen_generation);
+            }
+        }
+
+        void process_tasks(int id, unsigned my_generation)
+        {
+            for (;;)
+            {
+                Block blk{0, 0};
+                Matrix *U = nullptr;
+                Matrix *B = nullptr;
+                Matrix *V = nullptr;
+
+                pthread_mutex_lock(&mutex_);
+                if (my_generation != generation_ || tasks_ == nullptr)
+                {
+                    pthread_mutex_unlock(&mutex_);
+                    return;
+                }
+
+                if (next_task_ >= tasks_->size())
+                {
+                    if (active_workers_ == 0 && completed_generation_ != my_generation)
+                    {
+                        completed_generation_ = my_generation;
+                        pthread_cond_signal(&done_cv_);
+                    }
+                    pthread_mutex_unlock(&mutex_);
+                    return;
+                }
+
+                blk = (*tasks_)[next_task_++];
+                U = U_;
+                B = B_;
+                V = V_;
+                ++active_workers_;
+                pthread_mutex_unlock(&mutex_);
+
+                one_block_step(*U, *B, *V, blk.l, blk.r);
+                stats_[id].blocks += 1;
+                stats_[id].work += block_work(blk);
+
+                pthread_mutex_lock(&mutex_);
+                --active_workers_;
+                if (next_task_ >= tasks_->size() && active_workers_ == 0)
+                {
+                    completed_generation_ = my_generation;
+                    pthread_cond_signal(&done_cv_);
+                }
+                pthread_mutex_unlock(&mutex_);
+            }
+        }
+
+        PthreadBlockPool(const PthreadBlockPool &) = delete;
+        PthreadBlockPool &operator=(const PthreadBlockPool &) = delete;
+
+        int thread_count_;
+        bool stop_;
+        unsigned generation_;
+        unsigned completed_generation_;
+        const std::vector<Block> *tasks_;
+        size_t next_task_;
+        int active_workers_;
+        Matrix *U_;
+        Matrix *B_;
+        Matrix *V_;
+        pthread_mutex_t mutex_;
+        pthread_cond_t work_cv_;
+        pthread_cond_t done_cv_;
+        std::vector<pthread_t> threads_;
+        std::vector<WorkerArg> args_;
+        std::vector<WorkerStats> stats_;
+    };
+
     // 收尾步骤：
     // 1) 把奇异值（对角元）统一调整为非负；
     // 2) 按降序重排奇异值，同时同步重排 U、V 对应列。
@@ -435,6 +714,11 @@ bool gkh_svd_from_bidiagonal(Matrix &U, Matrix &B, Matrix &V, int max_iter, doub
     }
 
     bool converged = false;
+    PthreadBlockPool block_pool(choose_thread_count(n));
+    long long active_rounds = 0;
+    long long single_block_rounds = 0;
+    long long max_blocks_in_round = 0;
+    long long serial_single_block_work = 0;
 
     for (int iter = 0; iter < max_iter; ++iter)
     {
@@ -448,30 +732,40 @@ bool gkh_svd_from_bidiagonal(Matrix &U, Matrix &B, Matrix &V, int max_iter, doub
         std::vector<Block> blocks = split_active_blocks(B, n, tol);
 
         // 若全部是 1x1 块，说明所有超对角都已收敛为 0。
-        bool all_singletons = true;
+        std::vector<Block> work_blocks;
+        work_blocks.reserve(blocks.size());
         for (const auto &blk : blocks)
         {
             if (blk.r > blk.l)
             {
-                all_singletons = false;
-                break;
+                work_blocks.push_back(blk);
             }
         }
 
-        if (all_singletons)
+        if (work_blocks.empty())
         {
             converged = true;
             break;
         }
 
-        // 从右到左处理每个非平凡块，减少末端块对前面块的干扰。
-        for (int i = static_cast<int>(blocks.size()) - 1; i >= 0; --i)
+        ++active_rounds;
+        max_blocks_in_round = std::max(max_blocks_in_round, static_cast<long long>(work_blocks.size()));
+        if (work_blocks.size() == 1)
         {
-            if (blocks[i].r > blocks[i].l)
-            {
-                one_block_step(U, B, V, blocks[i].l, blocks[i].r);
-            }
+            ++single_block_rounds;
+            const Block blk = work_blocks[0];
+            one_block_step(U, B, V, blk.l, blk.r);
+            serial_single_block_work += block_work(blk);
+            continue;
         }
+
+        std::sort(work_blocks.begin(), work_blocks.end(), [](const Block &a, const Block &b)
+                  {
+                      const long long wa = block_work(a);
+                      const long long wb = block_work(b);
+                      return (wa != wb) ? (wa > wb) : (a.l > b.l);
+                  });
+        block_pool.run(U, B, V, work_blocks);
     }
 
     // 迭代结束后统一结构清理与标准化输出。
@@ -481,6 +775,15 @@ bool gkh_svd_from_bidiagonal(Matrix &U, Matrix &B, Matrix &V, int max_iter, doub
         B.at(i, i + 1) = 0.0;
     }
     make_nonnegative_and_sort(U, B, V);
+
+    std::printf("[pthread pool dynamic] threads=%d active_rounds=%lld single_block_rounds=%lld max_blocks_in_round=%lld serial_single_block_work=%lld\n",
+                block_pool.thread_count(), active_rounds, single_block_rounds, max_blocks_in_round, serial_single_block_work);
+    const std::vector<WorkerStats> &stats = block_pool.stats();
+    for (size_t id = 0; id < stats.size(); ++id)
+    {
+        std::printf("[pthread pool dynamic] worker %zu: blocks=%lld work=%lld\n",
+                    id, stats[id].blocks, stats[id].work);
+    }
 
     return converged;
 }
