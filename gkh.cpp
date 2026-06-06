@@ -3,14 +3,9 @@
 #include "givens.h"
 #include <algorithm>
 #include <cmath>
-#include <cstdio>
-#include <cstdlib>
-#include <fstream>
 #include <limits>
 #include <stdexcept>
-#include <string>
 #include <vector>
-#include <omp.h>
 
 #if defined(SVD_DISABLE_NEON) || !defined(__ARM_NEON) || !defined(__aarch64__)
 #error "This SIMD lab build requires AArch64 NEON. Please compile on the ARM server with NEON enabled."
@@ -28,61 +23,6 @@ namespace
         int l;
         int r;
     };
-
-    static long long block_work(const Block &blk)
-    {
-        const long long len = static_cast<long long>(blk.r - blk.l + 1);
-        return len * len;
-    }
-
-    static int read_positive_env(const char *name)
-    {
-        const char *env = std::getenv(name);
-        if (env == nullptr)
-        {
-            return 0;
-        }
-        const int value = std::atoi(env);
-        return value > 0 ? value : 0;
-    }
-
-    static int choose_thread_count(int n)
-    {
-        int threads = read_positive_env("SVD_OMP_THREADS");
-        if (threads <= 0)
-        {
-            threads = read_positive_env("OMP_NUM_THREADS");
-        }
-        if (threads <= 0)
-        {
-            threads = read_positive_env("PBS_NUM_PPN");
-        }
-        if (threads <= 0)
-        {
-            const char *nodefile = std::getenv("PBS_NODEFILE");
-            if (nodefile != nullptr)
-            {
-                std::ifstream in(nodefile);
-                std::string line;
-                while (std::getline(in, line))
-                {
-                    if (!line.empty())
-                    {
-                        ++threads;
-                    }
-                }
-            }
-        }
-        if (threads <= 0)
-        {
-            threads = omp_get_max_threads();
-        }
-        if (threads <= 0)
-        {
-            threads = omp_get_num_procs();
-        }
-        return std::min(std::max(1, threads), std::max(1, n));
-    }
 
     static inline void rotate_right_adjacent_cols_neon(double *row, int c0, const float64x2_t vc, const float64x2_t vsign)
     {
@@ -291,25 +231,24 @@ namespace
         const double x = B.at(l, l) * B.at(l, l) - mu;
         const double z = B.at(l, l) * B.at(l, l + 1);
         givens_rotation(x, z, c, s, rr, false);
-        // 限制 B 的写范围在当前活动块内，避免相邻块边界被并行任务同时写入。
-        apply_right_cols_range(B, l, l + 1, l, std::min(l + 1, r), c, s);
+        apply_right_cols_range(B, l, l + 1, l - 1, l + 1, c, s);
         apply_right_cols(V, l, l + 1, c, s);
 
         // 首次左乘：消去 (l+1, l)。
         givens_rotation(B.at(l, l), B.at(l + 1, l), c, s, rr, true);
-        apply_left_rows_range(B, l, l + 1, l, std::min(l + 2, r), c, s);
+        apply_left_rows_range(B, l, l + 1, l - 1, l + 2, c, s);
         accumulate_left_into_U(U, l, l + 1, c, s);
 
         for (int k = l + 1; k <= r - 1; ++k)
         {
             // 右乘：消去 (k-1, k+1)
             givens_rotation(B.at(k - 1, k), B.at(k - 1, k + 1), c, s, rr, false);
-            apply_right_cols_range(B, k, k + 1, std::max(k - 1, l), std::min(k + 1, r), c, s);
+            apply_right_cols_range(B, k, k + 1, k - 1, k + 1, c, s);
             apply_right_cols(V, k, k + 1, c, s);
 
             // 左乘：消去 (k+1, k)
             givens_rotation(B.at(k, k), B.at(k + 1, k), c, s, rr, true);
-            apply_left_rows_range(B, k, k + 1, std::max(k - 1, l), std::min(k + 2, r), c, s);
+            apply_left_rows_range(B, k, k + 1, k - 1, k + 2, c, s);
             accumulate_left_into_U(U, k, k + 1, c, s);
         }
     }
@@ -496,99 +435,42 @@ bool gkh_svd_from_bidiagonal(Matrix &U, Matrix &B, Matrix &V, int max_iter, doub
     }
 
     bool converged = false;
-    const int thread_count = choose_thread_count(n);
-    omp_set_dynamic(0);
-    omp_set_num_threads(thread_count);
 
-    std::vector<long long> thread_blocks(thread_count, 0);
-    std::vector<long long> thread_work(thread_count, 0);
-    std::vector<Block> work_blocks;
-    long long active_rounds = 0;
-    long long single_block_rounds = 0;
-    long long max_blocks_in_round = 0;
-    long long serial_single_block_work = 0;
-    int used_threads = thread_count;
-    bool stop = false;
-    bool has_parallel_work = false;
-
-#pragma omp parallel num_threads(thread_count) shared(U, B, V, converged, work_blocks, active_rounds, single_block_rounds, max_blocks_in_round, serial_single_block_work, thread_blocks, thread_work, used_threads, stop, has_parallel_work)
+    for (int iter = 0; iter < max_iter; ++iter)
     {
-        for (int iter = 0; iter < max_iter; ++iter)
+        // 清理数值噪声，并优先处理 d_k≈0 的特殊情形。
+        cleanup_bidiagonal(B, tol);
+        handle_diagonal_zeros(U, B, V, tol);
+
+        // 根据超对角线断点拆分活动块
+        // 这里子矩阵间是相互独立的，所以此处具有很大的并行潜力：你可以尝试多线程/多进程进行处理
+        // 但根据算法，收集 Givens 旋转并更新 U/V 需要在每个块内顺序执行，所以这可能给并行带来麻烦。
+        std::vector<Block> blocks = split_active_blocks(B, n, tol);
+
+        // 若全部是 1x1 块，说明所有超对角都已收敛为 0。
+        bool all_singletons = true;
+        for (const auto &blk : blocks)
         {
-            // 线程池版本：只建立一次 OpenMP 并行区，后续每轮复用同一组线程。
-#pragma omp single
+            if (blk.r > blk.l)
             {
-                used_threads = omp_get_num_threads();
-                work_blocks.clear();
-                stop = false;
-                has_parallel_work = false;
-
-                // 清理数值噪声，并优先处理 d_k≈0 的特殊情形。
-                cleanup_bidiagonal(B, tol);
-                handle_diagonal_zeros(U, B, V, tol);
-
-                // 根据超对角线断点拆分活动块
-                // 这里子矩阵间是相互独立的，所以此处具有很大的并行潜力：你可以尝试多线程/多进程进行处理
-                // 但根据算法，收集 Givens 旋转并更新 U/V 需要在每个块内顺序执行，所以这可能给并行带来麻烦。
-                std::vector<Block> blocks = split_active_blocks(B, n, tol);
-
-                for (const auto &blk : blocks)
-                {
-                    if (blk.r > blk.l)
-                    {
-                        work_blocks.push_back(blk);
-                    }
-                }
-
-                if (work_blocks.empty())
-                {
-                    converged = true;
-                    stop = true;
-                }
-                else
-                {
-                    ++active_rounds;
-                    max_blocks_in_round = std::max(max_blocks_in_round, static_cast<long long>(work_blocks.size()));
-                    if (work_blocks.size() == 1)
-                    {
-                        ++single_block_rounds;
-                        const Block blk = work_blocks[0];
-                        one_block_step(U, B, V, blk.l, blk.r);
-                        serial_single_block_work += block_work(blk);
-                    }
-                    else
-                    {
-                        std::sort(work_blocks.begin(), work_blocks.end(), [](const Block &a, const Block &b)
-                                  {
-                                      const long long wa = block_work(a);
-                                      const long long wb = block_work(b);
-                                      return (wa != wb) ? (wa > wb) : (a.l > b.l);
-                                  });
-                        has_parallel_work = true;
-                    }
-                }
-            }
-
-            if (stop)
-            {
+                all_singletons = false;
                 break;
             }
+        }
 
-            if (has_parallel_work)
+        if (all_singletons)
+        {
+            converged = true;
+            break;
+        }
+
+        // 从右到左处理每个非平凡块，减少末端块对前面块的干扰。
+        for (int i = static_cast<int>(blocks.size()) - 1; i >= 0; --i)
+        {
+            if (blocks[i].r > blocks[i].l)
             {
-                const int task_count = static_cast<int>(work_blocks.size());
-#pragma omp for schedule(dynamic, 1) nowait
-                for (int i = 0; i < task_count; ++i)
-                {
-                    const int tid = omp_get_thread_num();
-                    const Block blk = work_blocks[i];
-                    one_block_step(U, B, V, blk.l, blk.r);
-                    thread_blocks[tid] += 1;
-                    thread_work[tid] += block_work(blk);
-                }
+                one_block_step(U, B, V, blocks[i].l, blocks[i].r);
             }
-
-#pragma omp barrier
         }
     }
 
@@ -599,14 +481,6 @@ bool gkh_svd_from_bidiagonal(Matrix &U, Matrix &B, Matrix &V, int max_iter, doub
         B.at(i, i + 1) = 0.0;
     }
     make_nonnegative_and_sort(U, B, V);
-
-    std::printf("[openmp pool dynamic] threads=%d active_rounds=%lld single_block_rounds=%lld max_blocks_in_round=%lld serial_single_block_work=%lld\n",
-                used_threads, active_rounds, single_block_rounds, max_blocks_in_round, serial_single_block_work);
-    for (int id = 0; id < used_threads; ++id)
-    {
-        std::printf("[openmp pool dynamic] worker %d: blocks=%lld work=%lld\n",
-                    id, thread_blocks[id], thread_work[id]);
-    }
 
     return converged;
 }
