@@ -58,3 +58,10 @@ Thumbs.db
 
 
 perf
+*.time
+*.txt
+main_mpi
+main_mpi_profile
+main_simd
+main_simd_profile
+run_full_experiments.sh
