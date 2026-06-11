@@ -21,71 +21,13 @@
 #include <stdexcept>
 #include <vector>
 
-#if defined(SVD_DISABLE_NEON) || !defined(__ARM_NEON) || !defined(__aarch64__)
-#error "This SIMD lab build requires AArch64 NEON. Please compile on the ARM server with NEON enabled."
-#endif
-
-#include <arm_neon.h>
-
-// 连续内存点积。ARMv8/AArch64 上使用 NEON 的 128-bit float64x2_t，
-// 尾部单个元素用标量补齐，主体计算必须启用 NEON 才能编译。
-static double dot_contiguous(const double *a, const double *b, int len)
-{
-    double sum = 0.0;
-    int i = 0;
-    float64x2_t acc = vdupq_n_f64(0.0);
-    for (; i + 1 < len; i += 2)
-    {
-        acc = vaddq_f64(acc, vmulq_f64(vld1q_f64(a + i), vld1q_f64(b + i)));
-    }
-    double lanes[2];
-    vst1q_f64(lanes, acc);
-    sum = lanes[0] + lanes[1];
-    for (; i < len; ++i)
-    {
-        sum += a[i] * b[i];
-    }
-    return sum;
-}
-
-static void add_scaled_row(double *dst, const double *src, int len, double scale)
-{
-    int j = 0;
-    const float64x2_t s = vdupq_n_f64(scale);
-    for (; j + 1 < len; j += 2)
-    {
-        float64x2_t d = vld1q_f64(dst + j);
-        const float64x2_t x = vld1q_f64(src + j);
-        d = vaddq_f64(d, vmulq_f64(s, x));
-        vst1q_f64(dst + j, d);
-    }
-    for (; j < len; ++j)
-    {
-        dst[j] += scale * src[j];
-    }
-}
-
-static void sub_scaled_row(double *dst, const double *src, int len, double scale)
-{
-    int j = 0;
-    const float64x2_t s = vdupq_n_f64(scale);
-    for (; j + 1 < len; j += 2)
-    {
-        float64x2_t d = vld1q_f64(dst + j);
-        const float64x2_t x = vld1q_f64(src + j);
-        d = vsubq_f64(d, vmulq_f64(s, x));
-        vst1q_f64(dst + j, d);
-    }
-    for (; j < len; ++j)
-    {
-        dst[j] -= scale * src[j];
-    }
-}
-
 // 辅助函数，计算向量的范数（平方和开根）
 static double vector_norm(const std::vector<double> &v)
 {
-    return std::sqrt(dot_contiguous(v.data(), v.data(), static_cast<int>(v.size())));
+    double sum = 0.0;
+    for (double x : v)
+        sum += x * x;
+    return std::sqrt(sum);
 }
 
 // 将 m×n 矩阵 A（m ≥ n）化为上双对角形，返回 B，同时输出 U（m×m）和 V（n×n）
@@ -135,9 +77,11 @@ Matrix to_bidiagonal(const Matrix &A, Matrix &U, Matrix &V)
             v[0] += sigma; // v = x + sigma * e_1
 
             // 计算 v^T v
-            double vTv = dot_contiguous(v.data(), v.data(), static_cast<int>(v.size()));
+            double vTv = 0.0;
+            for (double vi : v)
+                vTv += vi * vi;
 
-            // SIMD实现：vTv、w/wU 点积与 rank-1 更新在 AArch64 上走 NEON。
+            // TODO(SIMD编程)：此处的Householder变换可以通过 SIMD 指令加速，你可以尝试实现
             if (vTv > 1e-28)
             {
                 const double beta = 2.0 / vTv;
@@ -145,18 +89,22 @@ Matrix to_bidiagonal(const Matrix &A, Matrix &U, Matrix &V)
                 // 手册里的 Householder 矩阵定义为 H = I - beta * v * v^T，其中 beta = 2 / (v^T v)
                 // 从左侧作用 H：B_new = H * B_old = B_old - beta * v * (v^T * B_old)
                 std::vector<double> w(n - k, 0.0);
+                for (int j = 0; j < n - k; ++j)
+                    for (int i = 0; i < m - k; ++i)
+                        w[j] += v[i] * B.at(k + i, k + j);
                 for (int i = 0; i < m - k; ++i)
-                    add_scaled_row(w.data(), B.row_ptr(k + i) + k, n - k, v[i]);
-                for (int i = 0; i < m - k; ++i)
-                    sub_scaled_row(B.row_ptr(k + i) + k, w.data(), n - k, beta * v[i]);
+                    for (int j = 0; j < n - k; ++j)
+                        B.at(k + i, k + j) -= beta * v[i] * w[j];
 
                 // 累积 U：U_new = U_old * H_k
                 // U[:, k:m] -= beta * (U[:, k:m] * v) * v^T
                 std::vector<double> wU(m, 0.0);
                 for (int i = 0; i < m; ++i)
-                    wU[i] = dot_contiguous(U.row_ptr(i) + k, v.data(), m - k);
+                    for (int j = 0; j < m - k; ++j)
+                        wU[i] += U.at(i, k + j) * v[j];
                 for (int i = 0; i < m; ++i)
-                    sub_scaled_row(U.row_ptr(i) + k, v.data(), m - k, beta * wU[i]);
+                    for (int j = 0; j < m - k; ++j)
+                        U.at(i, k + j) -= beta * wU[i] * v[j];
             }
         }
 
@@ -192,9 +140,11 @@ Matrix to_bidiagonal(const Matrix &A, Matrix &U, Matrix &V)
                 std::vector<double> v(y);
                 v[0] += sigma;
 
-                double vTv = dot_contiguous(v.data(), v.data(), static_cast<int>(v.size()));
+                double vTv = 0.0;
+                for (double vi : v)
+                    vTv += vi * vi;
 
-                // SIMD实现：行连续点积与行向量更新在 AArch64 上走 NEON。
+                // TODO(SIMD编程)：此处的Householder变换可以通过 SIMD 指令加速，你可以尝试实现
                 if (vTv > 1e-28)
                 {
                     const double beta = 2.0 / vTv;
@@ -203,17 +153,21 @@ Matrix to_bidiagonal(const Matrix &A, Matrix &U, Matrix &V)
                     // B_new = B_old * V_k = B_old - beta * (B_old * v) * v^T
                     std::vector<double> w(m - k, 0.0);
                     for (int i = 0; i < m - k; ++i)
-                        w[i] = dot_contiguous(B.row_ptr(k + i) + k + 1, v.data(), n - k - 1);
+                        for (int j = 0; j < n - k - 1; ++j)
+                            w[i] += B.at(k + i, k + 1 + j) * v[j];
                     for (int i = 0; i < m - k; ++i)
-                        sub_scaled_row(B.row_ptr(k + i) + k + 1, v.data(), n - k - 1, beta * w[i]);
+                        for (int j = 0; j < n - k - 1; ++j)
+                            B.at(k + i, k + 1 + j) -= beta * w[i] * v[j];
 
                     // 累积 V：V_new = V_old * V_k
                     // V[:, k+1:n] -= beta * (V[:, k+1:n] * v) * v^T
                     std::vector<double> wV(n, 0.0);
                     for (int i = 0; i < n; ++i)
-                        wV[i] = dot_contiguous(V.row_ptr(i) + k + 1, v.data(), n - k - 1);
+                        for (int j = 0; j < n - k - 1; ++j)
+                            wV[i] += V.at(i, k + 1 + j) * v[j];
                     for (int i = 0; i < n; ++i)
-                        sub_scaled_row(V.row_ptr(i) + k + 1, v.data(), n - k - 1, beta * wV[i]);
+                        for (int j = 0; j < n - k - 1; ++j)
+                            V.at(i, k + 1 + j) -= beta * wV[i] * v[j];
                 }
             }
 
